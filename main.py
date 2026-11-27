@@ -11,7 +11,6 @@ from datasets import load_dataset
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Training on: {device}")
 
-# Using 'gpt2' base keeps vocab at ~50k so it fits comfortably in M2 Unified Memory
 base_enc = tiktoken.get_encoding("gpt2")
 special_tokens = {
     **base_enc._special_tokens,
@@ -31,31 +30,27 @@ VOCAB_SIZE = enc.n_vocab
 PAD_ID = special_tokens["<|pad|>"]
 BOS_ID = special_tokens["<|bos|>"]
 EOS_ID = special_tokens["<|eos|>"]
-MAX_SEQ_LEN = 256  # Keep compact for fast M2 training
+MAX_SEQ_LEN = 256
 
 # ==========================================
-# 2. STREAMING HUGGING FACE DATASET
+# 2. STREAMING HUGGING FACE DATASET (PARQUET)
 # ==========================================
 class CodeSearchNetStream(IterableDataset):
     def __init__(self, split="train"):
-        self.dataset = load_dataset("code_search_net", "python", split=split, streaming=True)
+        # Uses the Parquet mirror so it loads cleanly without legacy dataset scripts
+        self.dataset = load_dataset("Nan-Do/code-search-net-python", split=split, streaming=True)
 
     def __iter__(self):
         for item in self.dataset:
-            docstring = item["func_documentation_string"].strip()
-            code = item["func_code_string"].strip()
+            docstring = (item.get("docstring") or item.get("func_documentation_string") or "").strip()
+            code = (item.get("code") or item.get("func_code_string") or "").strip()
 
-            # Skip empty or noisy samples
             if len(docstring) < 15 or len(code) < 20:
                 continue
 
-            # Encode and truncate
             src_ids = enc.encode(docstring, allowed_special="all")[:MAX_SEQ_LEN]
             code_ids = enc.encode(code, allowed_special="all")[:MAX_SEQ_LEN - 1]
 
-            # Shift target for teacher forcing:
-            # Decoder Input:  [<|bos|>, tok1, tok2, ...]
-            # Target Labels:  [tok1, tok2, ..., <|eos|>]
             tgt_in = [BOS_ID] + code_ids
             tgt_out = code_ids + [EOS_ID]
 
@@ -73,7 +68,7 @@ def collate_batch(batch):
     return src_padded, tgt_in_padded, tgt_out_padded
 
 # ==========================================
-# 3. ENCODER-DECODER MODEL
+# 3. ENCODER-DECODER MODEL (M2 COMPATIBLE)
 # ==========================================
 class LearnedPositionalEmbedding(nn.Module):
     def __init__(self, vocab_size, d_model, max_seq_len, pad_id):
@@ -89,7 +84,6 @@ class CodingTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=256, nhead=4, num_layers=3, dim_ff=1024, max_seq_len=256, pad_id=PAD_ID):
         super().__init__()
         self.embedding = LearnedPositionalEmbedding(vocab_size, d_model, max_seq_len, pad_id)
-        # PyTorch's built-in Transformer handles multi-layer Encoder + Decoder cleanly
         self.transformer = nn.Transformer(
             d_model=d_model,
             nhead=nhead,
@@ -98,6 +92,7 @@ class CodingTransformer(nn.Module):
             dim_feedforward=dim_ff,
             dropout=0.1,
             batch_first=True,
+            enable_nested_tensor=False,  # Prevents MPS crash on Apple Silicon
         )
         self.lm_head = nn.Linear(d_model, vocab_size)
 
@@ -121,21 +116,21 @@ class CodingTransformer(nn.Module):
         return self.lm_head(out)
 
 # ==========================================
-# 4. TRAINING LOOP (M2 OPTIMIZED)
+# 4. TRAINING LOOP
 # ==========================================
 train_loader = DataLoader(CodeSearchNetStream("train"), batch_size=8, collate_fn=collate_batch)
 model = CodingTransformer(vocab_size=VOCAB_SIZE, max_seq_len=MAX_SEQ_LEN, pad_id=PAD_ID).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-# ignore_index=PAD_ID ensures the model isn't penalized for padding slots
 criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
 model.train()
+print("Starting stream and training...")
 for step, (src_ids, tgt_in, tgt_out) in enumerate(train_loader):
     src_ids, tgt_in, tgt_out = src_ids.to(device), tgt_in.to(device), tgt_out.to(device)
 
     optimizer.zero_grad()
-    # Use bfloat16 on Mac M2 for faster training & lower RAM usage
+    # Note: If your PyTorch version complains about bfloat16 on mps, change dtype to torch.float16
     with torch.autocast(device_type="mps", dtype=torch.bfloat16):
         logits = model(src_ids, tgt_in, pad_id=PAD_ID)
         loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt_out.reshape(-1))
@@ -147,7 +142,6 @@ for step, (src_ids, tgt_in, tgt_out) in enumerate(train_loader):
     if step % 50 == 0:
         print(f"Step {step} | Loss: {loss.item():.4f}")
 
-    # Save a checkpoint every 1,000 steps
     if step > 0 and step % 1000 == 0:
         torch.save(model.state_dict(), f"function_ai_step_{step}.pt")
         print(f"Saved checkpoint at step {step}")
